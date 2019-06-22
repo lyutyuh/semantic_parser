@@ -36,3 +36,4 @@ from allennlp.models.basic_classifier import BasicClassifier
 from allennlp.models.srl_bert import SrlBert
 
 from allennlp.models.EMNLP_sempar import SemParser
+from allennlp.models.EMNLP_sempar_cvt import SemParserCVT

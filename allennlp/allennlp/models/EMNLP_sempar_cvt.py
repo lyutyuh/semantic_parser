@@ -18,10 +18,11 @@ import allennlp.nn.util as util
 from allennlp.training.metrics import CategoricalAccuracy, SpanBasedF1Measure
 
 
-@Model.register("sem_parser")
-class SemParser(Model):
+@Model.register("sem_parser_cvt")
+class SemParserCVT(Model):
     def __init__(self, vocab: Vocabulary,
                  text_field_embedder: TextFieldEmbedder,
+                 entity_embedder: TextFieldEmbedder,
                  encoder: Seq2VecEncoder,
                  label_namespace: str = "logical_form",
                  feedforward: Optional[FeedForward] = None,
@@ -34,6 +35,8 @@ class SemParser(Model):
         self.encoder = encoder
         
         self.text_field_embedder = text_field_embedder
+        self.entity_embedder = entity_embedder
+
         self.BOW_embedder_question = BagOfWordCountsTokenEmbedder(
             vocab, "tokens", projection_dim=self.encoder.get_output_dim())
         self.BOW_embedder_description = BagOfWordCountsTokenEmbedder(
@@ -48,6 +51,11 @@ class SemParser(Model):
             include_start_end_transitions=False
         )
         
+        self.crf_for_both = ConditionalRandomField(
+            self.num_tags, 
+            include_start_end_transitions=False
+        )
+        
         self.softmax_layer = Softmax()
         self.ce_loss = CrossEntropyLoss()
         
@@ -58,14 +66,13 @@ class SemParser(Model):
             self.dropout = torch.nn.Dropout(dropout)
         else:
             self.dropout = None
-        self._feedforward = feedforward
 
-        if feedforward is not None:
-            output_dim = feedforward.get_output_dim()
-        else:
-            output_dim = self.encoder.get_output_dim()
+        output_dim = self.encoder.get_output_dim()
             
-        self.question_pred_layer = Linear(4*output_dim, 3*self.num_tags)
+        self.pred_layer = Linear(4*output_dim, 3*self.num_tags)
+        self.load_pretrained_weights()
+        
+        self.pred_layer_both = Linear(8*output_dim, 3*self.num_tags)
         # if  constrain_crf_decoding and calculate_span_f1 are not
         # provided, (i.e., they're None), set them to True
         # if label_encoding is provided and False if it isn't.
@@ -73,56 +80,87 @@ class SemParser(Model):
         self.metrics = {}
         check_dimensions_match(text_field_embedder.get_output_dim(), encoder.get_input_dim(),
                                "text field embedding dim", "encoder input dim")
-        if feedforward is not None:
-            check_dimensions_match(4*encoder.get_output_dim(), feedforward.get_input_dim(),
-                                   "encoder output dim", "feedforward input dim")
         initializer(self)
 
+    def load_pretrained_weights(self):
+        weight_dir = "/home3/chenhongyin/LIU/WORK/semantic_parsing/DUMP/Model_single_relation/best.th"
+        state_dict = torch.load(weight_dir)
+        self.encoder.load_state_dict({ky[1+len("encoder"):]:val for ky,val in state_dict.items() if ky.startswith("encoder")})
+        self.text_field_embedder.load_state_dict({ky[1+len("text_field_embedder"):]:val for ky,val in state_dict.items() if "text_field_embedder" in ky})
+        self.BOW_embedder_question.load_state_dict({ky[1+len("BOW_embedder_question"):]:val for ky,val in state_dict.items() if "BOW_embedder_question" in ky})
+        self.BOW_embedder_description.load_state_dict({ky[1+len("BOW_embedder_description"):]:val for ky,val in state_dict.items() if "BOW_embedder_description" in ky})
+        self.BOW_embedder_detail.load_state_dict({ky[1+len("BOW_embedder_detail"):]:val for ky,val in state_dict.items() if "BOW_embedder_detail" in ky})
+        # using crf as the estimator for sequential tags
+        self.crf.load_state_dict({ky[4:]:val for ky,val in state_dict.items() if "crf" in ky})
+        self.pred_layer.load_state_dict({ky[1+len("question_pred_layer"):]:val for ky,val in state_dict.items() if "question_pred_layer" in ky})
+        return
+        
     @overrides
     def forward(self,  # type: ignore
                 question: Dict[str, torch.LongTensor],
                 entity_surface: Dict[str, torch.LongTensor],
                 entity_description: Dict[str, torch.LongTensor],
                 entity_detail: Dict[str, torch.LongTensor],
-                entity_type: torch.LongTensor = None,
+                entity_type: Dict[str, torch.LongTensor] = None,
                 logical_form_1: torch.LongTensor = None,
                 logical_form_2: torch.LongTensor = None,
-                logical_form_3: torch.LongTensor = None,
+                logical_form_both: torch.LongTensor = None,
                 metadata: List[Dict[str, Any]] = None,
                 **kwargs) -> Dict[str, torch.Tensor]:
+        
+        
         embedded_text_input = self.text_field_embedder(question)
+        
+        split_entity_surface = [{}, {}]
+        for x in entity_surface:
+            split_entity_surface[0][x] = entity_surface[x][:,0]
+            split_entity_surface[1][x] = entity_surface[x][:,1]
+            
+        embedded_entity_surface_1 = self.entity_embedder(split_entity_surface[0])
+        embedded_entity_surface_2 = self.entity_embedder(split_entity_surface[1])
+        
         batch_size = int(embedded_text_input.size(0))
         mask = util.get_text_field_mask(question)
         q_vec = self.encoder(embedded_text_input, mask)
         
         bow_question_vec = self.BOW_embedder_question(question['tokens'].unsqueeze(1))
-        bow_description_vec = self.BOW_embedder_description(entity_description['tokens'].unsqueeze(1))
-        bow_detail_vec = self.BOW_embedder_detail(entity_detail['tokens'].unsqueeze(1))
         
+        bow_description_1_vec = self.BOW_embedder_description(entity_description['tokens'][:,0,:].unsqueeze(1))
+        bow_detail_1_vec = self.BOW_embedder_detail(entity_detail['tokens'][:,0,:].unsqueeze(1))        
+        bow_description_2_vec = self.BOW_embedder_description(entity_description['tokens'][:,1,:].unsqueeze(1))
+        bow_detail_2_vec = self.BOW_embedder_detail(entity_detail['tokens'][:,1,:].unsqueeze(1))
         
-        fin_repr = torch.cat([bow_question_vec, bow_description_vec, bow_detail_vec,q_vec],1)
-        if self._feedforward is not None:
-            fin_repr = self._feedforward(fin_repr)
+        fin_repr_1 = torch.cat([bow_question_vec, bow_description_1_vec, bow_detail_1_vec,q_vec],1)
+        fin_repr_2 = torch.cat([bow_question_vec, bow_description_2_vec, bow_detail_2_vec,q_vec],1)
+        fin_repr_both = torch.cat([fin_repr_1, fin_repr_2],1)
         
-        pred_logits = self.question_pred_layer(fin_repr).view(batch_size, 3, -1)
+        pred_logits_1 = self.pred_layer(fin_repr_1).view(batch_size, 3, -1)
+        pred_logits_2 = self.pred_layer(fin_repr_2).view(batch_size, 3, -1)
+        pred_logits_both = self.pred_layer_both(fin_repr_both).view(batch_size, 3, -1)
         
-        
-        device_num = pred_logits.get_device()
+        device_num = pred_logits_1.get_device()
         if device_num < 0:
             device_num="cpu"
             
         mask = torch.ones((batch_size,3), dtype=torch.long,device=device_num)
-        vi_path = self.crf.viterbi_tags(pred_logits, mask)
-        pred_result = torch.stack([torch.tensor(x[0],device=device_num) for x in vi_path])
         
-        output = {"pred_result": pred_result}
+        vi_path_1 = self.crf.viterbi_tags(pred_logits_1, mask)
+        vi_path_2 = self.crf.viterbi_tags(pred_logits_2, mask)
+        vi_path_both = self.crf_for_both.viterbi_tags(pred_logits_both, mask)
+        
+        
+        pred_result_1 = torch.stack([torch.tensor(x[0],device=device_num) for x in vi_path_1])
+        pred_result_2 = torch.stack([torch.tensor(x[0],device=device_num) for x in vi_path_2])
+        pred_result_both = torch.stack([torch.tensor(x[0],device=device_num) for x in vi_path_both])
+        
+        output = {"pred_result_1": pred_result_1,
+                  "pred_result_2": pred_result_2,
+                  "pred_result_both": pred_result_both}
         if logical_form_1 is not None:
-            target = torch.stack([logical_form_1, 
-                                  logical_form_2,
-                                  logical_form_3],dim=1)
-            self.matched += int(((pred_result == target).int().sum(dim=-1) == 3).int().sum())
-            self.all_pred += int(pred_result.size(0))
-            output["loss"] = -self.crf(pred_logits, target, mask)
+            self.matched += int((((pred_result_1 == logical_form_1).int() + (pred_result_2 == logical_form_2).int() + (pred_result_both == logical_form_both).int()).sum(dim=-1) == 9).int().sum())
+            self.all_pred += int(pred_result_1.size(0))
+            
+            output["loss"] = -(self.crf(pred_logits_1, logical_form_1, mask) + self.crf(pred_logits_2, logical_form_2, mask) + self.crf_for_both(pred_logits_both, logical_form_both, mask))
             
         
         
@@ -142,7 +180,7 @@ class SemParser(Model):
         output_dict["tags"] = [
                 [self.vocab.get_token_from_index(int(instance_tags[0]), namespace="logical_form"),
                  self.vocab.get_token_from_index(int(instance_tags[1]), namespace="logical_form"),
-                 self.vocab.get_token_from_index(int(instance_tags[2]), namespace="logical_form"),
+                 self.vocab.get_token_from_index(int(instance_tags[2]), namespace="logical_form_both"),
                  ]
                 for instance_tags in output_dict["pred_result"]
         ]

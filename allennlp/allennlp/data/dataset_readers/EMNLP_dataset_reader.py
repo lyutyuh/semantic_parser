@@ -69,6 +69,7 @@ class EMNLPDatasetReader(DatasetReader):
         super().__init__(lazy)
         self._token_indexers = token_indexers or {'tokens': SingleIdTokenIndexer()}
         self.KB_path = KB_path
+        assert question_type == "single-relation" 
         self.label_namespace = label_namespace
         self.question_type = question_type
 
@@ -142,9 +143,9 @@ class EMNLPDatasetReader(DatasetReader):
         instance_fields['entity_type'] = MultiLabelField(e_type, "entity_type")
         instance_fields['entity'] = LabelField(entity, "entity")
         if logical_form is not None:
-            instance_fields['logical_form_1'] = LabelField(logical_form[0], "logical_form_1")
-            instance_fields['logical_form_2'] = LabelField(logical_form[1], "logical_form_2")
-            instance_fields['logical_form_3'] = LabelField(logical_form[2], "logical_form_3")
+            instance_fields['logical_form_1'] = LabelField(logical_form[0], "logical_form")
+            instance_fields['logical_form_2'] = LabelField(logical_form[1], "logical_form")
+            instance_fields['logical_form_3'] = LabelField(logical_form[2], "logical_form")
         else:
             pass
 
