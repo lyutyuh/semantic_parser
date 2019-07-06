@@ -2,6 +2,12 @@
 
 Code for final project. 
 
+## Install allennlp
+See
+```
+https://github.com/allenai/allennlp
+```
+
 ## Get Google KG data
 ```python
 api_key = "<your_api_key>" # ?
