@@ -26,5 +26,7 @@ while True:
 ```
 
 ## Train the model
+```
 allennlp train -s <dump_directory> allennlp/MY_CONFIG/sem_parser.config     # single-relation model training
 allennlp train -s <dump_directory> allennlp/MY_CONFIG/sem_parser_cvt.config # cvt model training
+```
